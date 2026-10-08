@@ -7,3 +7,4 @@ venv/
 Drone.pt
 Drone.onnx
 native/a733_npu/.deps/allwinner-model-zoo.tar.gz 
+start-visualai.sh
