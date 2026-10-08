@@ -26,8 +26,11 @@ Then copy this project, create an aarch64 virtual environment, and install its
 Python dependencies. Run the app with:
 
 ```bash
-HPP_PROFILE=radxa-a7s ./hpp.py
+HPP_PROFILE=radxa-a7s ./hpp02.py --camera /dev/video0
 ```
+
+Replace `/dev/video0` with the capture node reported by `v4l2-ctl --list-devices`.
+The `--camera` option avoids probing or prompting for the other A733 video nodes.
 
 The default A7S capture pipeline is the same 1080p NV12 ISP path, converted to
 BGR only at OpenCV's appsink. It uses a one-frame leaky queue to avoid an old

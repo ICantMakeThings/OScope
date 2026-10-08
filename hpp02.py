@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 
 from collections import deque
+import argparse
 import glob
 import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
+import threading
 import time
 import types
 
 import cv2
 import numpy as np
+from web_controls import WebControls
 
 MACHINE = platform.machine().lower()
 IS_ARM = MACHINE.startswith(("arm", "aarch64"))
@@ -46,13 +50,24 @@ DETECTOR_BACKEND = "opencv_hog" if PROFILE == "legacy-arm" else "mediapipe_pose"
 mp = None
 if DETECTOR_BACKEND == "mediapipe_pose":
     sys.modules.setdefault("sounddevice", types.ModuleType("sounddevice"))
+
     try:
         import mediapipe as mp
-    except (ImportError, OSError) as error:
+
+        # This program uses the legacy MediaPipe Solutions API.
+        if not hasattr(mp, "solutions") or not hasattr(mp.solutions, "pose"):
+            raise ImportError(
+                "installed MediaPipe does not provide the legacy "
+                "mp.solutions.pose API"
+            )
+
+    except (ImportError, OSError, AttributeError) as error:
         if PROFILE == "pc":
             raise
+
         print(f"MediaPipe unavailable ({error}); using OpenCV HOG fallback.")
         DETECTOR_BACKEND = "opencv_hog"
+        mp = None
 
 
 WINDOW_NAME = "OScope UI"
@@ -60,6 +75,7 @@ CONTROLS_WINDOW_NAME = "OScope Controls"
 SIDEBAR_WIDTH = 300
 CONTROLS_HEIGHT = 900
 AIM_RADIUS = 20
+ALIGNMENT_LOSS_GRACE = .15
 MODEL_FILE = "yolo11n.pt"
 MODEL_FILES = {
     "General YOLO": "yolo11n.pt",
@@ -169,16 +185,103 @@ class LedOutput:
             self.wiringpi.digitalWrite(self.PIN, 0)
 
 
+class ToneOutput:
+    SAMPLE_RATE = 44100
+
+    def __init__(self):
+        self.player = shutil.which("aplay") or shutil.which("paplay")
+        self.solid_process = None
+        self.solid_stop_event = None
+
+    def player_command(self):
+        if not self.player:
+            return None
+        if os.path.basename(self.player) == "paplay":
+            return [self.player, "--raw", "--format=s16le", "--rate=44100", "--channels=1"]
+        return [self.player, "-q", "-t", "raw", "-f", "S16_LE", "-r", "44100", "-c", "1"]
+
+    @classmethod
+    def samples(cls, frequency, duration, start_sample=0, fade=True):
+        count = round(cls.SAMPLE_RATE * duration)
+        samples = np.arange(count)
+        times = (samples + start_sample) / cls.SAMPLE_RATE
+        signal = np.sin(2 * np.pi * frequency * times) * 0.2
+        if fade:
+            envelope = np.minimum(1, np.minimum(times * 100, (duration - samples / cls.SAMPLE_RATE) * 100))
+            signal *= envelope
+        return (signal * 32767).astype("<i2").tobytes()
+
+    def play(self, frequency, duration=.12):
+        command = self.player_command()
+        if command is None:
+            return
+        try:
+            process = subprocess.Popen(command, stdin=subprocess.PIPE)
+        except OSError:
+            return
+
+        def write_tone():
+            try:
+                process.communicate(input=self.samples(frequency, duration))
+            except (BrokenPipeError, OSError):
+                pass
+
+        threading.Thread(target=write_tone, daemon=True).start()
+
+    def set_solid(self, active, frequency=740):
+        if active and (self.solid_process is None or self.solid_process.poll() is not None):
+            self.solid_process = None
+            command = self.player_command()
+            if command is None:
+                return
+            try:
+                process = subprocess.Popen(command, stdin=subprocess.PIPE)
+            except OSError:
+                return
+            self.solid_process = process
+            stop_event = threading.Event()
+            self.solid_stop_event = stop_event
+
+            def stream_tone():
+                sample_offset = 0
+                chunk_samples = round(self.SAMPLE_RATE * .1)
+                try:
+                    while not stop_event.is_set() and process.poll() is None:
+                        tone = self.samples(frequency, .1, sample_offset, fade=False)
+                        process.stdin.write(tone)
+                        process.stdin.flush()
+                        sample_offset += chunk_samples
+                except (BrokenPipeError, OSError, AttributeError, ValueError):
+                    pass
+                finally:
+                    try:
+                        process.stdin.close()
+                    except (AttributeError, OSError, ValueError):
+                        pass
+                    process.wait()
+
+            threading.Thread(target=stream_tone, daemon=True).start()
+        elif not active and self.solid_process is not None:
+            self.solid_process = None
+            stop_event = self.solid_stop_event
+            self.solid_stop_event = None
+            if stop_event is not None:
+                stop_event.set()
+
+
 class Controls:
     def __init__(self, camera_modes, camera_controls):
         self.toggles = {"Humans": True, "Animals": False, "Balls": False,
                         "Cars / vehicles": False, "Other objects": False,
                         "Drones": False, "Lite gun": False,
+                        "Monochrome display": True,
                         "Calibration mode": False,
                         "Enable GPIO LED": False}
         self.future_seconds = .5
         self.consecutive_frames = 1
         self.confidence_threshold = .40
+        self.crosshair_value = 255
+        self.alignment_tone_delay = .2
         self.tab = "Detection"
         self.toggle_rows, self.slider_rect = {}, None
         self.aim_position = None
@@ -256,25 +359,23 @@ class Controls:
         cv2.circle(panel, (knob, y + 13), 5, (245, 245, 245), -1)
         cv2.putText(panel, str(int(value)), (255, y + 17), cv2.FONT_HERSHEY_SIMPLEX, .43, (230, 230, 230), 1)
 
-    def draw_camera_panel(self, height, led):
+    def draw_camera_panel(self, height):
         panel = np.full((height, SIDEBAR_WIDTH, 3), 28, dtype=np.uint8)
         cv2.putText(panel, "CAMERA SETTINGS", (18, 29), cv2.FONT_HERSHEY_SIMPLEX, .62, (255, 255, 255), 2)
-        self.tab_rows = {}
         tab_width = (SIDEBAR_WIDTH - 36) // 3
         for index, name in enumerate(("Camera", "Detection", "Alert")):
             left = 18 + index * tab_width
-            top = height - 58
+            top = 43
             self.tab_rows[name] = (left, top, left + tab_width - 3, top + 27)
-            selected = name == "Camera"
+            selected = name == self.tab
             cv2.rectangle(panel, (left, top), (left + tab_width - 3, top + 27),
                           (65, 105, 155) if selected else (48, 51, 61), -1)
             cv2.putText(panel, name, (left + 10, top + 18), cv2.FONT_HERSHEY_SIMPLEX, .43,
                         (255, 255, 255), 1)
         mode = self.camera_modes[self.mode_index]
-        self.draw_camera_button(panel, "Video format", "Motion-JPEG" if mode[0] == "MJPG" else mode[0], 44)
-        self.draw_camera_button(panel, "Resolution", f"{mode[1]}x{mode[2]} @ {mode[3]:g} fps", 78)
-        y = 118
-        self.mode_option_rows = {}
+        self.draw_camera_button(panel, "Video format", "Motion-JPEG" if mode[0] == "MJPG" else mode[0], 83)
+        self.draw_camera_button(panel, "Resolution", f"{mode[1]}x{mode[2]} @ {mode[3]:g} fps", 117)
+        y = 157
         if self.mode_menu_open:
             # A real dropdown: selection is explicit, not a hidden cycle.
             for index, option in enumerate(self.camera_modes):
@@ -299,45 +400,22 @@ class Controls:
             cv2.putText(panel, "X" if checked else "", (128, y + 15), cv2.FONT_HERSHEY_SIMPLEX, .45, (255, 255, 255), 1)
             cv2.putText(panel, "White balance automatic", (148, y + 16), cv2.FONT_HERSHEY_SIMPLEX, .43, (225, 225, 225), 1)
             y += 31
-        cv2.line(panel, (18, y), (SIDEBAR_WIDTH - 18, y), (80, 80, 80), 1)
-        y += 30
-        cv2.putText(panel, "DETECTION", (18, y), cv2.FONT_HERSHEY_SIMPLEX, .62, (255, 255, 255), 2)
-        y += 16
-        for name in ("Humans", "Animals", "Balls", "Cars / vehicles", "Other objects"):
-            self.draw_toggle(panel, name, y)
-            y += 31
-        self.draw_toggle(panel, "Drones", y)
-        y += 47
-        cv2.line(panel, (18, y), (SIDEBAR_WIDTH - 18, y), (80, 80, 80), 1)
-        y += 29
-        cv2.putText(panel, f"PREDICTION: {self.future_seconds:.1f} s", (18, y), cv2.FONT_HERSHEY_SIMPLEX, .58, (255, 255, 255), 1)
-        slider_y = y + 22
-        self.slider_rect = (18, slider_y, SIDEBAR_WIDTH - 36, 18)
-        cv2.rectangle(panel, (18, slider_y), (SIDEBAR_WIDTH - 18, slider_y + 6), (95, 95, 95), -1)
-        x = int(18 + (self.future_seconds - .1) / 4.9 * (SIDEBAR_WIDTH - 36))
-        cv2.circle(panel, (x, slider_y + 3), 9, (50, 180, 255), -1)
-        cv2.putText(panel, "0.1", (18, slider_y + 29), cv2.FONT_HERSHEY_SIMPLEX, .4, (170, 170, 170), 1)
-        cv2.putText(panel, "5.0", (SIDEBAR_WIDTH - 42, slider_y + 29), cv2.FONT_HERSHEY_SIMPLEX, .4, (170, 170, 170), 1)
-        y = slider_y + 53
-        cv2.line(panel, (18, y), (SIDEBAR_WIDTH - 18, y), (80, 80, 80), 1)
-        y += 18
-        self.draw_toggle(panel, "Calibration mode", y)
-        y += 34
-        self.draw_toggle(panel, "Enable GPIO LED", y)
-        y += 42
-        cv2.putText(panel, "Calibration locks to red laser", (18, y), cv2.FONT_HERSHEY_SIMPLEX, .43, (180, 180, 180), 1)
-        cv2.putText(panel, "then turns itself off.", (18, y + 18), cv2.FONT_HERSHEY_SIMPLEX, .43, (180, 180, 180), 1)
-        cv2.putText(panel, led.message, (18, y + 52), cv2.FONT_HERSHEY_SIMPLEX, .43,
-                    (90, 235, 140) if led.state else (180, 180, 180), 1)
-        led_color = (60, 220, 80) if led.state else ((40, 40, 200) if led.enabled else (55, 55, 55))
-        cv2.circle(panel, (260, y + 48), 9, led_color, -1)
-        cv2.circle(panel, (260, y + 48), 9, (210, 210, 210), 1)
+        y += 10
+        self.draw_toggle(panel, "Monochrome display", y)
         cv2.putText(panel, "q / Esc: quit", (18, height - 20), cv2.FONT_HERSHEY_SIMPLEX, .45, (180, 180, 180), 1)
         return panel
 
     def draw(self, height, led):
+        self.tab_rows = {}
+        self.mode_option_rows = {}
+        self.camera_rows = {}
+        self.camera_slider_rows = {}
+        self.alert_slider_rows = {}
+        self.toggle_rows = {}
+        self.fps_slider_rect = None
+        self.slider_rect = None
         if self.tab == "Camera":
-            return self.draw_camera_panel(height, led)
+            return self.draw_camera_panel(height)
         panel = np.full((height, SIDEBAR_WIDTH, 3), 28, dtype=np.uint8)
         self.tab_rows = {}
         tab_width = (SIDEBAR_WIDTH - 36) // 3
@@ -348,12 +426,6 @@ class Controls:
                           (65, 105, 155) if name == self.tab else (48, 51, 61), -1)
             cv2.putText(panel, name, (left + 10, 61), cv2.FONT_HERSHEY_SIMPLEX, .43,
                         (255, 255, 255), 1)
-        self.mode_option_rows = {}
-        self.camera_rows = {}
-        self.camera_slider_rows = {}
-        self.alert_slider_rows = {}
-        self.toggle_rows = {}
-        self.slider_rect = None
         y = 94
         if self.tab == "Detection":
             cv2.putText(panel, "DETECTION", (18, y), cv2.FONT_HERSHEY_SIMPLEX, .62, (255, 255, 255), 2)
@@ -370,12 +442,18 @@ class Controls:
             x = int(18 + (self.future_seconds - .1) / 4.9 * (SIDEBAR_WIDTH - 36))
             cv2.circle(panel, (x, slider_y + 3), 9, (50, 180, 255), -1)
             y = slider_y + 53
+            self.draw_toggle(panel, "Monochrome display", y)
+            y += 34
         else:
             cv2.putText(panel, "ALERT", (18, y), cv2.FONT_HERSHEY_SIMPLEX, .62, (255, 255, 255), 2)
             y += 30
             self.draw_alert_slider(panel, "Consecutive detections", y, self.consecutive_frames, 1, 10, "frames")
             y += 48
             self.draw_alert_slider(panel, "Confidence to trigger", y, self.confidence_threshold, .01, 1.00, "%")
+            y += 48
+            self.draw_alert_slider(panel, "Crosshair level", y, self.crosshair_value, 0, 255, "level")
+            y += 48
+            self.draw_alert_slider(panel, "Alignment tone delay", y, self.alignment_tone_delay, .1, 2.0, "s")
             y += 60
             cv2.putText(panel, "LED requires alignment, confidence,", (18, y), cv2.FONT_HERSHEY_SIMPLEX, .4, (180, 180, 180), 1)
             cv2.putText(panel, "and the selected consecutive count.", (18, y + 17), cv2.FONT_HERSHEY_SIMPLEX, .4, (180, 180, 180), 1)
@@ -394,7 +472,12 @@ class Controls:
         ratio = (value - minimum) / (maximum - minimum)
         knob = int(left + np.clip(ratio, 0, 1) * (right - left))
         cv2.circle(panel, (knob, y + 13), 5, (50, 180, 255), -1)
-        label = f"{value:g} {suffix}" if suffix == "frames" else f"{value:.2f}"
+        if suffix == "frames":
+            label = f"{value:g} {suffix}"
+        elif suffix == "level":
+            label = f"{value:g}"
+        else:
+            label = f"{value:.1f}" if suffix == "s" else f"{value:.2f}"
         cv2.putText(panel, label, (255, y + 17), cv2.FONT_HERSHEY_SIMPLEX, .4, (230, 230, 230), 1)
         cv2.putText(panel, f"{minimum:g}", (left, y + 31), cv2.FONT_HERSHEY_SIMPLEX, .37, (170, 170, 170), 1)
         cv2.putText(panel, f"{maximum:g}", (right - 15, y + 31), cv2.FONT_HERSHEY_SIMPLEX, .37, (170, 170, 170), 1)
@@ -404,29 +487,33 @@ class Controls:
             if left <= x <= right and top <= y <= bottom:
                 self.tab = name
                 self.mode_menu_open = False
-                return
+                return True
         if self.tab == "Alert":
             for name, (top, bottom) in self.alert_slider_rows.items():
-                if top - 8 <= y <= bottom + 8:
+                if top - 8 <= y <= bottom + 8 and 115 <= x <= SIDEBAR_WIDTH - 18:
                     ratio = np.clip((x - 125) / 122, 0, 1)
                     if name == "Consecutive detections":
                         self.consecutive_frames = int(round(1 + ratio * 9))
-                    else:
+                    elif name == "Confidence to trigger":
                         self.confidence_threshold = round(.01 + ratio * .99, 2)
-                    return
+                    elif name == "Crosshair level":
+                        self.crosshair_value = int(round(ratio * 255))
+                    else:
+                        self.alignment_tone_delay = round(.1 + ratio * 1.9, 1)
+                    return True
         for index, (top, bottom) in self.mode_option_rows.items():
-            if top <= y <= bottom:
+            if top <= y <= bottom and 125 <= x <= SIDEBAR_WIDTH - 18:
                 self.mode_index = index
                 self.mode_menu_open = False
                 self.camera_changed = True
-                return
+                return True
         if self.fps_slider_rect:
             sx, sy, sw, sh = self.fps_slider_rect
             if sx - 8 <= x <= sx + sw + 8 and sy - 8 <= y <= sy + sh + 8:
                 self.set_fps_ratio((x - sx) / sw)
-                return
+                return True
         for name, (top, bottom) in self.camera_rows.items():
-            if top <= y <= bottom:
+            if top <= y <= bottom and 125 <= x <= SIDEBAR_WIDTH - 18:
                 if name == "Video format":
                     formats = list(dict.fromkeys(mode[0] for mode in self.camera_modes))
                     next_format = formats[(formats.index(self.camera_modes[self.mode_index][0]) + 1) % len(formats)]
@@ -438,28 +525,43 @@ class Controls:
                     control = self.camera_controls[name]
                     control["value"] = 0 if control["value"] else 1
                     control["changed"] = True
-                return
+                return True
         for name, (top, bottom) in self.camera_slider_rows.items():
-            if top - 5 <= y <= bottom + 5:
+            if top - 5 <= y <= bottom + 5 and 115 <= x <= SIDEBAR_WIDTH - 18:
                 control = self.camera_controls[name]
                 control["value"] = round(control["min"] + np.clip((x - 125) / 122, 0, 1) * (control["max"] - control["min"]))
                 control["changed"] = True
-                return
+                return True
         if self.slider_rect:
             sx, sy, sw, sh = self.slider_rect
             if sx - 10 <= x <= sx + sw + 10 and sy - 12 <= y <= sy + sh + 16:
                 self.future_seconds = round(.1 + np.clip((x - sx) / sw, 0, 1) * 4.9, 1)
-                return
+                return True
         for name, (top, bottom) in self.toggle_rows.items():
-            if top <= y <= bottom:
+            if top <= y <= bottom and 18 <= x <= SIDEBAR_WIDTH - 18:
                 self.toggles[name] = not self.toggles[name]
-                return
+                return True
+        return False
 
 
-def get_camera_list():
+def get_camera_list(requested_device=None):
+    requested_device = requested_device or os.environ.get("HPP_CAMERA_DEVICE")
+    if requested_device:
+        if not os.path.exists(requested_device):
+            print(f"Camera device does not exist: {requested_device}", flush=True)
+            return []
+        index_match = re.search(r"\d+$", requested_device)
+        index = int(index_match.group()) if index_match else 0
+        return [{"index": index, "device": requested_device, "res": "auto"}]
     cameras = []
     for device in sorted(glob.glob("/dev/video*"), key=lambda item: int(re.search(r"\d+$", item).group())):
         index = int(re.search(r"\d+$", device).group())
+        if IS_RADXA_A7S:
+            device_info = v4l2_output(device, "--all").lower()
+            if "video capture" in device_info or "sunxi-vin" in device_info:
+                cameras.append({"index": index, "device": device,
+                                "res": "1920x1080" if "sunxi-vin" in device_info else "auto"})
+            continue
         cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
         if cap.isOpened():
             ok, frame = cap.read()
@@ -496,7 +598,8 @@ def get_camera_modes(device):
     if pending_size and pixel_format:
         modes.append((pixel_format, *pending_size, 30))
     if not modes:
-        modes = [("MJPG", width, height, 30) for width, height in (
+        pixel_format = "NV12" if IS_RADXA_A7S and "sunxi-vin" in v4l2_output(device, "--all").lower() else "MJPG"
+        modes = [(pixel_format, width, height, 30) for width, height in (
             (1920, 1080), (1280, 720), (640, 480), (640, 360),
             (352, 288), (320, 240), (176, 144), (160, 120),
         )]
@@ -561,8 +664,8 @@ def open_camera(device, mode):
     return cap
 
 
-def select_camera_ui():
-    cameras = get_camera_list()
+def select_camera_ui(requested_device=None):
+    cameras = get_camera_list(requested_device)
     if not cameras:
         print("No cameras found!")
         return None
@@ -585,14 +688,20 @@ def select_camera_ui():
 
 
 def find_red_laser(frame):
-    """Return the strongest compact red spot, or None when no laser is visible."""
+    """Return the strongest compact red or bright monochrome spot."""
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, (0, 130, 170), (10, 255, 255))
     mask |= cv2.inRange(hsv, (170, 130, 170), (180, 255, 255))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
-        return None
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        threshold = max(200, int(np.percentile(gray, 99.9)))
+        mask = cv2.inRange(gray, threshold, 255)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
     contour = max(contours, key=cv2.contourArea)
     area = cv2.contourArea(contour)
     if not 2 <= area <= 1000:
@@ -644,7 +753,7 @@ def hog_person_detection(hog, frame):
 
 
 def yolo_detections(model, frame, toggles, model_name, confidence_threshold):
-    active = {name for name in ("Animals", "Balls", "Cars / vehicles", "Other objects", "Drones") if toggles[name]}
+    active = {name for name in ("Humans", "Animals", "Balls", "Cars / vehicles", "Other objects", "Drones") if toggles[name]}
     if model_name != "General YOLO":
         active.add("Other objects")
     if not active:
@@ -655,10 +764,13 @@ def yolo_detections(model, frame, toggles, model_name, confidence_threshold):
             label = NPU_CLASS_NAMES[model_name][class_id]
             custom_model = model_name != "General YOLO"
             wanted = (custom_model and ("Other objects" in active or "Drones" in active)) or (
-                not custom_model and (("Animals" in active and label in ANIMAL_LABELS) or
+                not custom_model and (("Humans" in active and label == "person") or
+                ("Animals" in active and label in ANIMAL_LABELS) or
                 ("Balls" in active and label == "sports ball") or
                 ("Cars / vehicles" in active and label in VEHICLE_LABELS) or
-                ("Other objects" in active and label != "person")))
+                ("Other objects" in active and label != "person" and
+                 label not in ANIMAL_LABELS and label != "sports ball" and
+                 label not in VEHICLE_LABELS)))
             if wanted:
                 detections.append({"label": label, "box": (x1, y1, x2, y2),
                                    "center": np.array([(x1 + x2) / 2, (y1 + y2) / 2]),
@@ -676,7 +788,9 @@ def yolo_detections(model, frame, toggles, model_name, confidence_threshold):
               not custom_model and (("Animals" in active and label in ANIMAL_LABELS) or
               ("Balls" in active and label == "sports ball") or
               ("Cars / vehicles" in active and label in VEHICLE_LABELS) or
-              ("Other objects" in active and label != "person")))
+              ("Other objects" in active and label != "person" and
+               label not in ANIMAL_LABELS and label != "sports ball" and
+               label not in VEHICLE_LABELS)))
         if wanted:
             x1, y1, x2, y2 = item.xyxy[0].cpu().numpy()
             detections.append({"label": label, "box": (x1, y1, x2, y2),
@@ -686,11 +800,23 @@ def yolo_detections(model, frame, toggles, model_name, confidence_threshold):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="OScope camera viewer")
+    parser.add_argument(
+        "--camera", "-c", metavar="DEVICE",
+        help="A733 camera device, for example /dev/video0",
+    )
+    parser.add_argument("--web-host", default=os.environ.get("HPP_WEB_HOST", "0.0.0.0"),
+                        help="Settings server bind address (default: all interfaces)")
+    parser.add_argument("--web-port", type=int, default=int(os.environ.get("HPP_WEB_PORT", "8765")),
+                        help="Settings server port (default: 8765)")
+    parser.add_argument("--windowed", action="store_true",
+                        help="Keep the camera window resizable instead of fullscreen")
+    args = parser.parse_args()
     print(f"Hardware profile: {PROFILE} ({MACHINE}); camera backend: "
           f"{os.environ.get('HPP_CAMERA_BACKEND', 'auto')}; YOLO backend: {YOLO_BACKEND}")
     if YOLO_BACKEND == "npu" and not os.path.isfile("liba733_npu.so"):
         raise SystemExit("Radxa A7S detected but liba733_npu.so is missing; run ./build_a733.sh first")
-    camera = select_camera_ui()
+    camera = select_camera_ui(args.camera if IS_RADXA_A7S else None)
     if camera is None:
         return
     modes = get_camera_modes(camera["device"])
@@ -731,23 +857,27 @@ def main():
     controls.mode_index = next((i for i, mode in enumerate(modes)
                                 if mode[0] == actual_format and mode[1:3] == (actual_width, actual_height)),
                                controls.mode_index)
-    predictor, led = MotionPredictor(), LedOutput()
+    predictor, led, tones = MotionPredictor(), LedOutput(), ToneOutput()
     detection_streak = 0
     streak_label = None
+    previous_detection_count = 0
+    aligned_since = None
+    alignment_lost_since = None
     object_models, frame_times = {}, deque(maxlen=30)
     cached_detections, last_detection_at, detection_signature = [], 0.0, None
+    web_controls = WebControls(controls, args.web_host, args.web_port)
+    web_controls.publish_state(led.message, led.state)
+    web_controls.start()
+    print(f"LAN settings: {web_controls.lan_url()}")
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
-    cv2.namedWindow(CONTROLS_WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
+    if not args.windowed:
+        cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
     window_sized = False
-
-    def controls_mouse(event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN:
-            controls.click(x, y)
-
-    cv2.setMouseCallback(CONTROLS_WINDOW_NAME, controls_mouse)
-    print("Running. Resize the camera window freely; use the controls window for toggles. Press q or Escape to quit.")
+    print("Running. Browser settings are available on the LAN; press q or Escape to quit.")
+    last_state_publish = 0.0
     try:
         while True:
+            web_controls.apply_pending()
             started = time.time()
             if controls.camera_changed:
                 cap.release()
@@ -773,6 +903,10 @@ def main():
                 window_sized = False
                 cv2.waitKey(1)
                 continue
+            if frame.ndim == 2:
+                frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+            elif frame.shape[2] == 4:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
             height, width = frame.shape[:2]
             if not window_sized:
                 cv2.resizeWindow(WINDOW_NAME, width, height)
@@ -789,7 +923,7 @@ def main():
                     cv2.circle(frame, tuple(laser.astype(int)), 7, (0, 0, 255), 1)
 
             general_requested = any(controls.toggles[name] for name in
-                                    ("Animals", "Balls", "Cars / vehicles", "Other objects"))
+                                    ("Humans", "Animals", "Balls", "Cars / vehicles", "Other objects"))
             selected_models = []
             if general_requested:
                 selected_models.append("General YOLO")
@@ -798,7 +932,7 @@ def main():
             if controls.toggles["Lite gun"]:
                 selected_models.append("Lite gun")
             yolo_requested = bool(selected_models)
-            yolo_needed = yolo_requested and DETECTOR_BACKEND != "opencv_hog"
+            yolo_needed = yolo_requested and (IS_RADXA_A7S or DETECTOR_BACKEND != "opencv_hog")
             signature = (controls.confidence_threshold,
                          tuple(controls.toggles[name] for name in ("Humans", "Animals", "Balls", "Cars / vehicles", "Other objects", "Drones", "Lite gun")))
             detection_hz = 5 if DETECTOR_BACKEND == "opencv_hog" else (YOLO_DETECTION_HZ if yolo_needed else 30)
@@ -806,7 +940,7 @@ def main():
             ran_detection = signature != detection_signature or started - last_detection_at >= interval
             if ran_detection:
                 cached_detections = []
-                if controls.toggles["Humans"]:
+                if controls.toggles["Humans"] and (not yolo_needed or "General YOLO" not in selected_models):
                     person = (hog_person_detection(hog, frame) if DETECTOR_BACKEND == "opencv_hog"
                               else pose_detection(pose, frame))
                     if person:
@@ -824,6 +958,13 @@ def main():
                                                                 model_name, controls.confidence_threshold))
                 last_detection_at, detection_signature = started, signature
             detections = cached_detections
+            if ran_detection:
+                detection_count = len(detections)
+                if detection_count > previous_detection_count:
+                    tones.play(880)
+                elif detection_count < previous_detection_count:
+                    tones.play(440)
+                previous_detection_count = detection_count
 
             target = min(detections, key=lambda item: np.linalg.norm(item["center"] - aim), default=None)
             qualifying_target = (target is not None and
@@ -859,9 +1000,21 @@ def main():
                 predictor.reset()
 
             aligned = future is not None and np.linalg.norm(future - aim) <= AIM_RADIUS
-            led.enabled = controls.toggles["Enable LED"]
+            if aligned:
+                alignment_lost_since = None
+                if aligned_since is None:
+                    aligned_since = started
+                tones.set_solid(started - aligned_since >= controls.alignment_tone_delay)
+            elif aligned_since is not None:
+                if alignment_lost_since is None:
+                    alignment_lost_since = started
+                elif started - alignment_lost_since >= ALIGNMENT_LOSS_GRACE:
+                    aligned_since = None
+                    alignment_lost_since = None
+                    tones.set_solid(False)
+            led.enabled = controls.toggles["Enable GPIO LED"]
             led.set(aligned and detection_streak >= controls.consecutive_frames)
-            aim_color = (0, 255, 0) if aligned else (255, 170, 0)
+            aim_color = (controls.crosshair_value,) * 3
             aim_point = tuple(aim.astype(int))
             overlay_scale = max(width / 640, height / 480)
             cross_arm = max(8, round(8 * overlay_scale))
@@ -872,6 +1025,10 @@ def main():
             cv2.line(frame, (aim_point[0], aim_point[1] - cross_arm),
                      (aim_point[0], aim_point[1] + cross_arm), aim_color, cross_thickness, cv2.LINE_AA)
 
+            if started - last_state_publish >= .25:
+                web_controls.publish_state(led.message, led.state)
+                last_state_publish = started
+
             elapsed_ms = (time.time() - started) * 1000
             frame_times.append(elapsed_ms)
             work_ms = max(0, elapsed_ms - capture_ms)
@@ -881,13 +1038,15 @@ def main():
                 cv2.putText(frame, f"confidence: {target.get('confidence', 1.0):.2f} | detections: {detection_streak}/{controls.consecutive_frames}",
                             (10, 51), cv2.FONT_HERSHEY_SIMPLEX, .48, (255, 255, 255), 1)
 
-            cv2.imshow(WINDOW_NAME, frame)
-            menu_extra = len(controls.camera_modes) * 28 if controls.mode_menu_open else 0
-            cv2.imshow(CONTROLS_WINDOW_NAME, controls.draw(max(height, CONTROLS_HEIGHT + menu_extra), led))
+            display_frame = (cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                             if controls.toggles["Monochrome display"] else frame)
+            cv2.imshow(WINDOW_NAME, display_frame)
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
     finally:
+        web_controls.close()
+        tones.set_solid(False)
         led.close()
         if pose is not None:
             pose.close()

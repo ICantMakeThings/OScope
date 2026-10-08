@@ -1,6 +1,7 @@
 """ctypes wrapper for the native A733 YOLO11 detector."""
 
 import ctypes
+import os
 from pathlib import Path
 
 
@@ -27,6 +28,7 @@ class A733NPUDetector:
             raise RuntimeError(
                 "A733 NPU backend is not built. Run ./build_a733.sh on the Radxa A7S first."
             )
+        self._runtime_libraries = self._load_runtime_libraries()
         self._library = ctypes.CDLL(str(library_path))
         self._library.a733_npu_create.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)]
         self._library.a733_npu_create.restype = ctypes.c_int
@@ -46,6 +48,36 @@ class A733NPUDetector:
             message = self._library.a733_npu_last_error()
             detail = message.decode(errors="replace") if message else "unknown native error"
             raise RuntimeError(f"Could not load A733 model {model_path}: {detail}")
+
+    @staticmethod
+    def _load_runtime_libraries():
+        project_dir = Path(__file__).resolve().parent
+        runtime_dir = os.environ.get("HPP_NPU_RUNTIME_DIR")
+        candidates = [Path(runtime_dir)] if runtime_dir else []
+        candidates.extend((
+            project_dir / "npu_runtime",
+            project_dir / "native/a733_npu/.deps/model-zoo/common/npuruntime/lib_linux_aarch64/A733",
+        ))
+        last_error = "no runtime directory found"
+        for directory in candidates:
+            if not directory.is_dir():
+                continue
+            libraries = []
+            try:
+                for name in ("libVIPhal.so", "libNBGlinker.so"):
+                    path = directory / name
+                    if not path.is_file():
+                        raise FileNotFoundError(path)
+                    libraries.append(ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL))
+                return libraries
+            except OSError as error:
+                last_error = error
+                continue
+        raise RuntimeError(
+            "A733 NPU runtime libraries are missing. Run ./build_a733.sh again, "
+            "or set HPP_NPU_RUNTIME_DIR to the directory containing "
+            f"libNBGlinker.so and libVIPhal.so ({last_error})."
+        )
 
     def detect(self, frame, confidence_threshold):
         if self._handle is None:

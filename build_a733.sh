@@ -41,4 +41,10 @@ cmake -S "$ROOT/native/a733_npu" -B "$BUILD_DIR" \
     -DA733_MODEL_ZOO_DIR="$DEPS_DIR/model-zoo"
 cmake --build "$BUILD_DIR" --parallel
 cp "$BUILD_DIR/liba733_npu.so" "$ROOT/liba733_npu.so"
+RUNTIME_DIR="$DEPS_DIR/model-zoo/common/npuruntime/lib_linux_aarch64/A733"
+mkdir -p "$ROOT/npu_runtime"
+cp "$RUNTIME_DIR/libNBGlinker.so" "$RUNTIME_DIR/libVIPhal.so" "$ROOT/npu_runtime/"
+test -f "$ROOT/npu_runtime/libNBGlinker.so"
+test -f "$ROOT/npu_runtime/libVIPhal.so"
+echo "A733 runtime libraries installed in $ROOT/npu_runtime"
 file "$ROOT/liba733_npu.so"

@@ -1,6 +1,10 @@
 # OScope
 
-OScope is an OpenCV camera viewer with Human, Drone, ect. detection and motion prediction, named as "OpenScope" or "oh-scope!"
+OScope is an OpenCV camera viewer with Human, Drone, ect. detection and motion prediction, named as "OpenScope"
+
+It is a (Airsoft!!!) target prediction algorythm that detects where something is going, and tells you where to shoot.
+
+The hardware is: A Radxa Cubie A7S, Display (if a/v, then also a usb-c dp alt to a/v converter), High speed camera eg: OV9281 and a power source like a power bank.
 
 ## Models
 
@@ -20,8 +24,12 @@ On the Radxa, run `./build_a733.sh` before starting the application. The script 
 ## Run
 
 ```bash
-source activate.sh
-./hpp.py
+source venv2/bin/activate
+export DISPLAY=:0
+export XAUTHORITY="$HOME/.Xauthority"
+python3 ./hpp02.py --camera /dev/video0
 ```
+
+The camera window opens fullscreen on the device's `:0` display. The settings server listens on all network interfaces at port `8765`; open `http://<radxa-lan-ip>:8765` from a browser on the same LAN. Use `--windowed` to keep the camera window resizable, `--web-port` to change the port, or `--web-host 127.0.0.1` to restrict the server to the device itself. The LAN settings page has no authentication, so run it only on a trusted network.
 
 Profiles can be selected with `HPP_PROFILE=pc`, `HPP_PROFILE=radxa-a7s`, or `HPP_PROFILE=legacy-arm`. `HPP_YOLO_IMGSZ` and `HPP_YOLO_HZ` can tune CPU inference load.

@@ -1,4 +1,6 @@
 OLD.py
 venv/
 __pycache__/
-BACKUP.V3.py
+archive.py
+sync-visualai.sh
+venv/
