@@ -7,7 +7,7 @@ It is a (Airsoft!!!) target prediction algorythm that detects where something is
 The hardware is: A Radxa Cubie A7S, Display (if a/v, then also a usb-c dp alt to a/v converter), High speed camera eg: OV9281 and a power source like a power bank.
 
 ![img1](img/IMG_1473-nobg.png)
-
+![img5](img/img5.jpg)
 ## Models
 
 | Display name | File | Source |
